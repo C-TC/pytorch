@@ -94,6 +94,10 @@ bool Work::wait(std::chrono::milliseconds timeout) {
   return true;
 }
 
+bool Work::waitWithDelayMS(std::chrono::milliseconds delay) {
+  return true;
+}
+
 void Work::abort() {
   TORCH_CHECK(false, "Work::abort not implemented.");
 }

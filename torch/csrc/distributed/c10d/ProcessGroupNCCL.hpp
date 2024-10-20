@@ -308,6 +308,9 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     // or timed out. If timeout, exception will be thrown.
     bool wait(std::chrono::milliseconds timeout = kNoTimeout) override;
 
+    bool waitWithDelayMS(std::chrono::milliseconds delay = std::chrono::milliseconds(0)) override;
+    void setFinishTime();
+
     void abort() override;
 
     // Let current stream wait on the completion of the NCCL work
@@ -455,6 +458,10 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     std::optional<uint64_t> trace_id_;
     DebugLevel distDebugLevel_;
     friend class ProcessGroupNCCL;
+
+    std::chrono::time_point<std::chrono::steady_clock> finishTime_;
+    std::mutex finishTimeMutex_;
+    std::atomic<bool> isFinishTimeSet_{false};
   };
 
   class CUDAEventCache {

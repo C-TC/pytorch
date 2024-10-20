@@ -485,7 +485,7 @@ std::future<bool> launchAsyncGilCheck() {
   return resultFuture;
 }
 
-const int64_t ProcessGroupNCCL::kWatchdogThreadSleepMillis = 100;
+const int64_t ProcessGroupNCCL::kWatchdogThreadSleepMillis = 1;
 constexpr int64_t kSynchronizeBusyWaitMillis = 1;
 thread_local uint64_t ProcessGroupNCCL::ncclActiveGroupCounter_ = 0;
 
@@ -781,6 +781,8 @@ bool ProcessGroupNCCL::WorkNCCL::wait(std::chrono::milliseconds timeout) {
     currentStream.synchronize();
   }
 
+  setFinishTime();
+
   // If exception is detected, throw it from the main CPU thread
   if (exception()) {
     // Abort NCCL communicators
@@ -801,6 +803,26 @@ bool ProcessGroupNCCL::WorkNCCL::wait(std::chrono::milliseconds timeout) {
   }
 #endif
   // Always return true, because abort API is not implemented.
+  return true;
+}
+
+void ProcessGroupNCCL::WorkNCCL::setFinishTime() {
+  std::lock_guard<std::mutex> lock(finishTimeMutex_);
+  if (!isFinishTimeSet_.load()) {
+    finishTime_ = std::chrono::steady_clock::now();
+    isFinishTimeSet_.store(true);
+  }
+}
+
+bool ProcessGroupNCCL::WorkNCCL::waitWithDelayMS(std::chrono::milliseconds delay_in_ms) {
+  this->wait();
+  TORCH_CHECK(isFinishTimeSet_.load(), "Finish time is not set");
+  auto currentTimepoint = std::chrono::steady_clock::now();
+  auto timeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      currentTimepoint - finishTime_);
+  if (timeElapsed < delay_in_ms) {
+    std::this_thread::sleep_for(delay_in_ms - timeElapsed);
+  }
   return true;
 }
 
@@ -1978,6 +2000,7 @@ void ProcessGroupNCCL::watchdogHandler() {
 
       // Clean up completed work
       if (work.isCompleted()) {
+        work.setFinishTime();
         if (work.futureWorkResult_ && work.finishedGPUExecutionInternal() &&
             !work.futureWorkResult_->completed()) {
           work.futureWorkResult_->markCompleted(
