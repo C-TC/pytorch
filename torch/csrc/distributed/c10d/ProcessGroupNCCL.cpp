@@ -781,8 +781,6 @@ bool ProcessGroupNCCL::WorkNCCL::wait(std::chrono::milliseconds timeout) {
     currentStream.synchronize();
   }
 
-  setFinishTime();
-
   // If exception is detected, throw it from the main CPU thread
   if (exception()) {
     // Abort NCCL communicators
@@ -815,13 +813,22 @@ void ProcessGroupNCCL::WorkNCCL::setFinishTime() {
 }
 
 bool ProcessGroupNCCL::WorkNCCL::waitWithDelayMS(std::chrono::milliseconds delay_in_ms) {
-  this->wait();
+  if (!isFinishTimeSet_.load()) {
+    // Finish time is not set, wait for the work to complete.
+    // Otherwise watchdog thread have already recorded the finish time.
+    // Avoid unnessary synchronization.
+    this->wait();
+    while (!isCompleted()) {
+      // force host synchronization for correct timing
+      std::this_thread::sleep_for(std::chrono::milliseconds(kSynchronizeBusyWaitMillis));
+    }
+    setFinishTime();
+  }
+  
   TORCH_CHECK(isFinishTimeSet_.load(), "Finish time is not set");
   auto currentTimepoint = std::chrono::steady_clock::now();
-  auto timeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-      currentTimepoint - finishTime_);
-  if (timeElapsed < delay_in_ms) {
-    std::this_thread::sleep_for(delay_in_ms - timeElapsed);
+  if (currentTimepoint < finishTime_ + delay_in_ms) {
+    std::this_thread::sleep_until(finishTime_ + delay_in_ms);
   }
   return true;
 }
