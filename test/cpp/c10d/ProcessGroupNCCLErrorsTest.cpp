@@ -59,9 +59,9 @@ class ProcessGroupNCCLSimulateErrors : public c10d::ProcessGroupNCCL {
     return c10d::ProcessGroupNCCL::checkForNCCLErrors(ncclComm);
   }
 
-  std::chrono::duration<int64_t, std::milli> getWatchdogSleepInterval() {
-    return std::chrono::milliseconds(
-        ProcessGroupNCCLSimulateErrors::kWatchdogThreadSleepMillis);
+  std::chrono::duration<int64_t, std::micro> getWatchdogSleepInterval() {
+    return std::chrono::microseconds(
+        ProcessGroupNCCLSimulateErrors::kWatchdogThreadSleepMicros);
   }
 
   c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL> initWork(

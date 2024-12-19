@@ -302,7 +302,7 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     // or timed out. If timeout, exception will be thrown.
     bool wait(std::chrono::milliseconds timeout = kNoTimeout) override;
 
-    bool waitWithDelayMS(std::chrono::milliseconds delay = std::chrono::milliseconds(0)) override;
+    bool waitWithLatDelayMS(std::chrono::milliseconds delay = std::chrono::milliseconds(0)) override;
     void setFinishTime();
 
     void abort() override;
@@ -459,6 +459,7 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     std::chrono::time_point<std::chrono::steady_clock> finishTime_;
     std::mutex finishTimeMutex_;
     std::atomic<bool> isFinishTimeSet_{false};
+    int bandwidthDelayMS_;
   };
 
   class CUDAEventCache {
@@ -898,7 +899,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
       Fn fn,
       int peer,
       OpType opType,
-      const char* profilingTitle = nullptr);
+      const char* profilingTitle = nullptr,
+      int bandwidthDelayMS = 0);
 
   template <typename Fn, typename PreProcess, typename PostProcess>
   c10::intrusive_ptr<Work> pointToPoint(
@@ -908,7 +910,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
       OpType opType,
       PreProcess pre,
       PostProcess post,
-      const char* profilingTitle);
+      const char* profilingTitle,
+      int bandwidthDelayMS);
 
   c10::intrusive_ptr<Work> allreduce_impl(
       at::Tensor& tensor,
@@ -999,7 +1002,7 @@ class TORCH_API ProcessGroupNCCL : public Backend {
 
   std::string getNCCLWatchdogTimeoutExitMsg(const std::string& exitReason);
 
-  static const int64_t kWatchdogThreadSleepMillis;
+  static const int64_t kWatchdogThreadSleepMicros;
 
   // The store is used to broadcast the NCCL unique ID of rank 0. This store
   // comes with prefix and it is different across ProcessGroup NCCL instances

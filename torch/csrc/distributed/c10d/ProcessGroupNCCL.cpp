@@ -10,6 +10,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGraph.h>
+#include <ATen/cuda/Sleep.h>
 #include <c10/core/DeviceType.h>
 #include <c10/cuda/CUDAAllocatorConfig.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
@@ -425,8 +426,8 @@ static std::future<bool> launchAsyncGilCheck() {
   return resultFuture;
 }
 
-const int64_t ProcessGroupNCCL::kWatchdogThreadSleepMillis = 1;
-constexpr int64_t kSynchronizeBusyWaitMillis = 1;
+const int64_t ProcessGroupNCCL::kWatchdogThreadSleepMicros = 100;
+constexpr int64_t kSynchronizeBusyWaitMicros = 100;
 thread_local uint64_t ProcessGroupNCCL::ncclActiveGroupCounter_ = 0;
 
 std::ostream& operator<<(
@@ -755,7 +756,7 @@ bool ProcessGroupNCCL::WorkNCCL::wait(std::chrono::milliseconds timeout) {
       }
       // Yield
       std::this_thread::sleep_for(
-          std::chrono::milliseconds(kSynchronizeBusyWaitMillis));
+          std::chrono::microseconds(kSynchronizeBusyWaitMicros));
     }
   } else if (isBarrierOp_ && !isCompleted()) {
     // For barrier wait when timeout is unspecified, we block the CPU thread on
@@ -797,7 +798,7 @@ void ProcessGroupNCCL::WorkNCCL::setFinishTime() {
   }
 }
 
-bool ProcessGroupNCCL::WorkNCCL::waitWithDelayMS(std::chrono::milliseconds delay_in_ms) {
+bool ProcessGroupNCCL::WorkNCCL::waitWithLatDelayMS(std::chrono::milliseconds delay_in_ms) {
   if (!isFinishTimeSet_.load()) {
     // Finish time is not set, wait for the work to complete.
     // Otherwise watchdog thread have already recorded the finish time.
@@ -805,15 +806,16 @@ bool ProcessGroupNCCL::WorkNCCL::waitWithDelayMS(std::chrono::milliseconds delay
     this->wait();
     while (!isCompleted()) {
       // force host synchronization for correct timing
-      std::this_thread::sleep_for(std::chrono::milliseconds(kSynchronizeBusyWaitMillis));
+      std::this_thread::sleep_for(std::chrono::microseconds(kSynchronizeBusyWaitMicros));
     }
     setFinishTime();
   }
   
   TORCH_CHECK(isFinishTimeSet_.load(), "Finish time is not set");
   auto currentTimepoint = std::chrono::steady_clock::now();
-  if (currentTimepoint < finishTime_ + delay_in_ms) {
-    std::this_thread::sleep_until(finishTime_ + delay_in_ms);
+  auto bandwidthDelay = std::chrono::milliseconds(bandwidthDelayMS_);
+  if (currentTimepoint < finishTime_ + delay_in_ms + bandwidthDelay) {
+    std::this_thread::sleep_until(finishTime_ + delay_in_ms + bandwidthDelay);
   }
   return true;
 }
@@ -1292,7 +1294,7 @@ void ProcessGroupNCCL::waitForPendingWorks() {
     }
 
     std::this_thread::sleep_for(
-        std::chrono::milliseconds(kWatchdogThreadSleepMillis));
+        std::chrono::microseconds(kWatchdogThreadSleepMicros));
   }
 }
 
@@ -1695,7 +1697,7 @@ void ProcessGroupNCCL::heartbeatMonitor() {
       // we haven't polled for `heartbeat_timeout` seconds and there haven't
       // any work added or removed for `watchdog_timeout` seconds.
       if (computeDeltaMS(lastWorkListUpdateTime_, currentTime) >=
-              kWatchdogThreadSleepMillis &&
+              long(kWatchdogThreadSleepMicros / 1000) &&
           computeDeltaMS(lastTimePollStore, currentTime) >=
               coordCheckIntervalMilSec_) {
         lastTimePollStore = currentTime;
@@ -2115,11 +2117,11 @@ void ProcessGroupNCCL::watchdogHandler() {
 
   while (!done || !terminateProcessGroup_.load()) {
     std::unique_lock<std::mutex> lock(workMetaListMutex_);
-    // We busy-poll the work vector every kWatchdogThreadSleepMillis
-    // milliseconds as long as the atomic is True.
+    // We busy-poll the work vector every kWatchdogThreadSleepMicros
+    // microseconds as long as the atomic is True.
     workMetaListCV_.wait_for(
         lock,
-        std::chrono::milliseconds(kWatchdogThreadSleepMillis),
+        std::chrono::microseconds(kWatchdogThreadSleepMicros),
         [&]() -> bool { return terminateProcessGroup_.load(); });
     // Bump up heart beat by one.
     heartbeat_++;
@@ -2295,11 +2297,11 @@ void ProcessGroupNCCL::runHookLoop() {
   bool done = false;
   while (!done || !terminateProcessGroup_.load()) {
     std::unique_lock<std::mutex> lock(completedWorkListMutex_);
-    // We busy-poll the work vector every kWatchdogThreadSleepMillis
-    // milliseconds as long as the atomic is True.
+    // We busy-poll the work vector every kWatchdogThreadSleepMicros
+    // microseconds as long as the atomic is True.
     completedWorkListCV_.wait_for(
         lock,
-        std::chrono::milliseconds(kWatchdogThreadSleepMillis),
+        std::chrono::microseconds(kWatchdogThreadSleepMicros),
         [&]() -> bool {
           return !completedWorkList_.empty() || terminateProcessGroup_.load();
         });
@@ -3454,7 +3456,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     OpType opType,
     PreProcess pre,
     PostProcess post,
-    const char* profilingTitle) {
+    const char* profilingTitle,
+    int bandwidthDelayMS) {
   // avoidRecordStreams_ note:
   // send, recv, and irecv should be ok with avoidRecordStreams,
   // However, for isend, I don't think the API requires the user
@@ -3689,6 +3692,20 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     at::cuda::CUDAGraph::dec_pending_event_queries();
     return nullptr;
   }
+
+  // bandwidth injection
+  work->bandwidthDelayMS_ = bandwidthDelayMS;
+  // sleep on the stream for bandwidthDelayMS
+  if (bandwidthDelayMS > 0) {
+    // get gpu clock rate of current device
+    cudaDeviceProp prop{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device.index()));
+    int clockRate = prop.clockRate; // in KHz
+    // sleep for bandwidthDelayMS milliseconds
+    int64_t sleepCycles = (int64_t)clockRate * bandwidthDelayMS;
+    // sleep on the stream
+    at::cuda::sleep(sleepCycles, ncclStream);
+  }
 }
 
 template <typename Fn, typename PreProcess, typename PostProcess>
@@ -3747,7 +3764,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     Fn fn,
     int peer,
     OpType opType,
-    const char* profilingTitle) {
+    const char* profilingTitle,
+    int bandwidthDelayMS) {
   return pointToPoint(
       tensor,
       fn,
@@ -3756,7 +3774,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
       [](at::cuda::CUDAStream&,
          c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
       [](at::cuda::CUDAStream&) {},
-      profilingTitle);
+      profilingTitle,
+      bandwidthDelayMS);
 }
 
 c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_sparse(
@@ -4799,7 +4818,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::alltoall(
 c10::intrusive_ptr<Work> ProcessGroupNCCL::send(
     std::vector<at::Tensor>& tensors,
     int dstRank,
-    int /* unused */) {
+    int bandwidthDelayMS) {
   TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
   // @lint-ignore CLANGTIDY
   auto tensor = tensors.back();
@@ -4841,14 +4860,15 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::send(
       },
       dstRank,
       OpType::SEND,
-      c10::str("nccl:send ", rank_, "->", dstRank).c_str());
+      c10::str("nccl:send ", rank_, "->", dstRank).c_str(),
+      bandwidthDelayMS);
   return ret;
 }
 
 c10::intrusive_ptr<Work> ProcessGroupNCCL::recv(
     std::vector<at::Tensor>& tensors,
     int srcRank,
-    int /* unused */) {
+    int bandwidthDelayMS) {
   TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
   // @lint-ignore CLANGTIDY
   auto tensor = tensors.back();
@@ -4890,7 +4910,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::recv(
       },
       srcRank,
       OpType::RECV,
-      c10::str("nccl:recv ", rank_, "<-", srcRank).c_str());
+      c10::str("nccl:recv ", rank_, "<-", srcRank).c_str(),
+      bandwidthDelayMS);
   return ret;
 }
 

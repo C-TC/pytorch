@@ -3224,8 +3224,8 @@ such as `dist.all_reduce(tensor, async_op=True)`.
                   or timed out. If timeout, exception will be thrown.
             )")
       .def(
-          "wait_with_delay_in_ms",
-          &::c10d::Work::waitWithDelayMS,
+          "wait_with_lat_delay_in_ms",
+          &::c10d::Work::waitWithLatDelayMS,
           py::arg("delay_in_ms") = std::chrono::milliseconds(0),
           py::call_guard<py::gil_scoped_release>()
       )

@@ -100,7 +100,7 @@ bool Work::wait(std::chrono::milliseconds timeout) {
   return true;
 }
 
-bool Work::waitWithDelayMS(std::chrono::milliseconds delay) {
+bool Work::waitWithLatDelayMS(std::chrono::milliseconds delay) {
   return true;
 }
 
