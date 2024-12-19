@@ -110,7 +110,7 @@ class TORCH_API Work : public torch::CustomClassHolder {
   //
   virtual bool wait(std::chrono::milliseconds timeout = kNoTimeout);
 
-  virtual bool waitWithDelayMS(std::chrono::milliseconds delay = std::chrono::milliseconds(0));
+  virtual bool waitWithLatDelayMS(std::chrono::milliseconds delay = std::chrono::milliseconds(0));
 
   virtual void abort();
 
