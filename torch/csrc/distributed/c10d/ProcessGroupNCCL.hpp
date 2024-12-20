@@ -305,7 +305,6 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     bool wait(std::chrono::milliseconds timeout = kNoTimeout) override;
 
     bool waitWithLatDelayMS(std::chrono::milliseconds delay = std::chrono::milliseconds(0)) override;
-    void setFinishTime();
 
     void abort() override;
 
@@ -458,10 +457,9 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     DebugLevel distDebugLevel_;
     friend class ProcessGroupNCCL;
 
-    std::chrono::time_point<std::chrono::steady_clock> finishTime_;
-    std::mutex finishTimeMutex_;
-    std::atomic<bool> isFinishTimeSet_{false};
-    int bandwidthDelayMS_;
+
+    std::shared_ptr<at::cuda::CUDAEvent> endEventForInjection_;
+    int bandwidthDelayMS_{0};
   };
 
   class CUDAEventCache {

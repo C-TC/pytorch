@@ -425,8 +425,8 @@ static std::future<bool> launchAsyncGilCheck() {
   return resultFuture;
 }
 
-const int64_t ProcessGroupNCCL::kWatchdogThreadSleepMicros = 100;
-constexpr int64_t kSynchronizeBusyWaitMicros = 100;
+const int64_t ProcessGroupNCCL::kWatchdogThreadSleepMicros = 100000;
+constexpr int64_t kSynchronizeBusyWaitMicros = 1000;
 thread_local uint64_t ProcessGroupNCCL::ncclActiveGroupCounter_ = 0;
 
 std::ostream& operator<<(
@@ -490,6 +490,7 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(
   }
   futureWorkResult_ =
       c10::make_intrusive<at::ivalue::Future>(c10::AnyEnumType::get());
+  endEventForInjection_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDefault);
 }
 
 ProcessGroupNCCL::WorkNCCL::WorkNCCL(const WorkNCCL& w)
@@ -514,7 +515,8 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(const WorkNCCL& w)
       futureWorkResult_(w.futureWorkResult_),
       timingEnabled_(w.timingEnabled_),
       trace_id_(w.trace_id_),
-      distDebugLevel_(w.distDebugLevel_) {
+      distDebugLevel_(w.distDebugLevel_),
+      endEventForInjection_(w.endEventForInjection_) {
   exception_ = w.exception_;
 }
 
@@ -788,32 +790,34 @@ bool ProcessGroupNCCL::WorkNCCL::wait(std::chrono::milliseconds timeout) {
   return true;
 }
 
-void ProcessGroupNCCL::WorkNCCL::setFinishTime() {
-  std::lock_guard<std::mutex> lock(finishTimeMutex_);
-  if (!isFinishTimeSet_.load()) {
-    finishTime_ = std::chrono::steady_clock::now();
-    isFinishTimeSet_.store(true);
-  }
-}
 
 bool ProcessGroupNCCL::WorkNCCL::waitWithLatDelayMS(std::chrono::milliseconds delay_in_ms) {
-  if (!isFinishTimeSet_.load()) {
-    // Finish time is not set, wait for the work to complete.
-    // Otherwise watchdog thread have already recorded the finish time.
-    // Avoid unnessary synchronization.
-    this->wait();
-    while (!isCompleted()) {
-      // force host synchronization for correct timing
-      std::this_thread::sleep_for(std::chrono::microseconds(kSynchronizeBusyWaitMicros));
-    }
-    setFinishTime();
-  }
-  
-  TORCH_CHECK(isFinishTimeSet_.load(), "Finish time is not set");
-  auto currentTimepoint = std::chrono::steady_clock::now();
-  auto bandwidthDelay = std::chrono::milliseconds(bandwidthDelayMS_);
-  if (currentTimepoint < finishTime_ + delay_in_ms + bandwidthDelay) {
-    std::this_thread::sleep_until(finishTime_ + delay_in_ms + bandwidthDelay);
+  // get gpu clock rate of current device
+  cudaDeviceProp prop{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device_.index())); // get properties here, because it costs ~2ms!
+  int clockRate = prop.clockRate; // in KHz
+  // first call the original wait
+  // block current stream on the end event of communication
+  this->wait();
+  // then enqueue an event to current stream, and sync with cpu
+  // create event
+  auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+  auto event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDefault);
+  // record event
+  event->record(currentStream);
+  // sync host with event
+  event->synchronize();
+  // elpase time
+  float elapsed_time = endEventForInjection_->elapsed_time(*event);
+  // check if the elapsed time is less than the delay
+  float latency_delay = delay_in_ms.count();
+  float remaining_delay = bandwidthDelayMS_ + latency_delay - elapsed_time;
+  if (remaining_delay > 0) {
+    // sleep on current stream
+    // sleep for remaining_delay milliseconds
+    int64_t sleepCycles = (int64_t)clockRate * remaining_delay;
+    // sleep on the stream
+    at::cuda::sleep(sleepCycles, currentStream);
   }
   return true;
 }
@@ -2212,7 +2216,6 @@ void ProcessGroupNCCL::watchdogHandler() {
         // Work status logging for desync debug
         desyncDebugger_.logWorkEnd(work);
 
-        work.setFinishTime();
         if (work.futureWorkResult_ && work.finishedGPUExecutionInternal() &&
             !work.futureWorkResult_->completed()) {
           work.futureWorkResult_->markCompleted(
@@ -3639,6 +3642,21 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     }
   }
 
+  work->endEventForInjection_->record(ncclStream);
+  // bandwidth injection
+  work->bandwidthDelayMS_ = bandwidthDelayMS;
+  // sleep on the stream for bandwidthDelayMS
+  if (bandwidthDelayMS > 0) {
+    // get gpu clock rate of current device
+    cudaDeviceProp prop{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device.index()));
+    int clockRate = prop.clockRate; // in KHz
+    // sleep for bandwidthDelayMS milliseconds
+    int64_t sleepCycles = (int64_t)clockRate * bandwidthDelayMS;
+    // sleep on the stream
+    at::cuda::sleep(sleepCycles, ncclStream);
+  }
+
   // Enqueue P2P op so that it can be cancelled by NCCL watchdog
   c10::cuda::CaptureStatus capture_status =
       c10::cuda::currentStreamCaptureStatusMayInitCtx();
@@ -3652,20 +3670,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
   } else {
     at::cuda::CUDAGraph::dec_pending_event_queries();
     return nullptr;
-  }
-
-  // bandwidth injection
-  work->bandwidthDelayMS_ = bandwidthDelayMS;
-  // sleep on the stream for bandwidthDelayMS
-  if (bandwidthDelayMS > 0) {
-    // get gpu clock rate of current device
-    cudaDeviceProp prop{};
-    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device.index()));
-    int clockRate = prop.clockRate; // in KHz
-    // sleep for bandwidthDelayMS milliseconds
-    int64_t sleepCycles = (int64_t)clockRate * bandwidthDelayMS;
-    // sleep on the stream
-    at::cuda::sleep(sleepCycles, ncclStream);
   }
 }
 
