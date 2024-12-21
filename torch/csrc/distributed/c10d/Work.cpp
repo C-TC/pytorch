@@ -102,6 +102,10 @@ c10::intrusive_ptr<c10::ivalue::Future> Work::getFuture() {
   TORCH_CHECK(false, "Work::getFuture not implemented.")
 }
 
+bool Work::waitWithLatDelayMS(std::chrono::milliseconds delay) {
+  return this->wait();
+}
+
 void Work::finish(std::exception_ptr exception) {
   std::unique_lock<std::mutex> lock(mutex_);
   completed_ = true;

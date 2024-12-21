@@ -12,6 +12,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGraph.h>
+#include <ATen/cuda/Sleep.h>
 #include <c10/core/DeviceType.h>
 #include <c10/cuda/CUDAAllocatorConfig.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
@@ -483,6 +484,7 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(
     ncclEndEvent_ = std::make_shared<at::cuda::CUDAEvent>(
         enableTiming ? cudaEventDefault : cudaEventDisableTiming);
   }
+  endEventForInjection_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDefault);
 }
 
 ProcessGroupNCCL::WorkNCCL::WorkNCCL(const WorkNCCL& w)
@@ -505,7 +507,8 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(const WorkNCCL& w)
       store_(w.store_),
       timingEnabled_(w.timingEnabled_),
       trace_id_(w.trace_id_),
-      distDebugLevel_(w.distDebugLevel_) {
+      distDebugLevel_(w.distDebugLevel_),
+      endEventForInjection_(w.endEventForInjection_) {
   exception_ = w.exception_;
 }
 
@@ -750,6 +753,40 @@ void ProcessGroupNCCL::WorkNCCL::abort() {
   ncclCommDevIdxMapMutex.lock();
   ncclCommDevIdxMap.erase(ncclComm_);
   ncclCommDevIdxMapMutex.unlock();
+}
+
+bool ProcessGroupNCCL::WorkNCCL::waitWithLatDelayMS(std::chrono::milliseconds delay_in_ms) {
+  // get gpu clock rate of current device
+  cudaDeviceProp prop{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device_.index())); // get properties here, because it costs ~2ms!
+  int clockRate = prop.clockRate; // in KHz
+  // first call the original wait
+  // block current stream on the end event of communication
+  this->wait();
+  if (delay_in_ms.count() == 0 and bandwidthDelayMS_ == 0) {
+    return true;
+  }
+  // then enqueue an event to current stream, and sync with cpu
+  // create event
+  auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+  auto event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDefault);
+  // record event
+  event->record(currentStream);
+  // sync host with event
+  event->synchronize();
+  // elpase time
+  float elapsed_time = endEventForInjection_->elapsed_time(*event);
+  // check if the elapsed time is less than the delay
+  float latency_delay = delay_in_ms.count();
+  float remaining_delay = bandwidthDelayMS_ + latency_delay - elapsed_time;
+  if (remaining_delay > 0) {
+    // sleep on current stream
+    // sleep for remaining_delay milliseconds
+    int64_t sleepCycles = (int64_t)clockRate * remaining_delay;
+    // sleep on the stream
+    at::cuda::sleep(sleepCycles, currentStream);
+  }
+  return true;
 }
 
 ProcessGroupNCCL::CUDAEventCache::CUDAEventCache() {}
@@ -3001,7 +3038,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     OpType opType,
     PreProcess pre,
     PostProcess post,
-    const char* profilingTitle) {
+    const char* profilingTitle,
+    int bandwidthDelayMS) {
   // avoidRecordStreams_ note:
   // send, recv, and irecv should be ok with avoidRecordStreams,
   // However, for isend, I don't think the API requires the user
@@ -3206,6 +3244,21 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     }
   }
 
+  work->endEventForInjection_->record(ncclStream);
+  // bandwidth injection
+  work->bandwidthDelayMS_ = bandwidthDelayMS;
+  // sleep on the stream for bandwidthDelayMS
+  if (bandwidthDelayMS > 0) {
+    // get gpu clock rate of current device
+    cudaDeviceProp prop{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device.index()));
+    int clockRate = prop.clockRate; // in KHz
+    // sleep for bandwidthDelayMS milliseconds
+    int64_t sleepCycles = (int64_t)clockRate * bandwidthDelayMS;
+    // sleep on the stream
+    at::cuda::sleep(sleepCycles, ncclStream);
+  }
+
   // Enqueue P2P op so that it can be cancelled by NCCL watchdog
   c10::cuda::CaptureStatus capture_status =
       c10::cuda::currentStreamCaptureStatusMayInitCtx();
@@ -3251,7 +3304,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     Fn fn,
     int peer,
     OpType opType,
-    const char* profilingTitle) {
+    const char* profilingTitle,
+    int bandwidthDelayMS) {
   return pointToPoint(
       tensor,
       fn,
@@ -3260,7 +3314,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
       [](at::cuda::CUDAStream&,
          c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
       [](at::cuda::CUDAStream&) {},
-      profilingTitle);
+      profilingTitle,
+      bandwidthDelayMS);
 }
 
 c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_sparse(
@@ -4253,7 +4308,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::alltoall(
 c10::intrusive_ptr<Work> ProcessGroupNCCL::send(
     std::vector<at::Tensor>& tensors,
     int dstRank,
-    int /* unused */) {
+    int bandwidthDelayMS) {
   TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
   // @lint-ignore CLANGTIDY
   auto tensor = tensors.back();
@@ -4287,14 +4342,15 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::send(
       },
       dstRank,
       OpType::SEND,
-      c10::str("nccl:send ", rank_, "->", dstRank).c_str());
+      c10::str("nccl:send ", rank_, "->", dstRank).c_str(),
+      bandwidthDelayMS);
   return ret;
 }
 
 c10::intrusive_ptr<Work> ProcessGroupNCCL::recv(
     std::vector<at::Tensor>& tensors,
     int srcRank,
-    int /* unused */) {
+    int bandwidthDelayMS) {
   TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
   // @lint-ignore CLANGTIDY
   auto tensor = tensors.back();
@@ -4328,7 +4384,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::recv(
       },
       srcRank,
       OpType::RECV,
-      c10::str("nccl:recv ", rank_, "<-", srcRank).c_str());
+      c10::str("nccl:recv ", rank_, "<-", srcRank).c_str(),
+      bandwidthDelayMS);
   return ret;
 }
 

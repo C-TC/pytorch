@@ -2968,6 +2968,12 @@ such as `dist.all_reduce(tensor, async_op=True)`.
           py::arg("timeout") = kNoTimeout,
           py::call_guard<py::gil_scoped_release>())
       .def(
+          "wait_with_lat_delay_in_ms",
+          &::c10d::Work::waitWithLatDelayMS,
+          py::arg("delay_in_ms") = std::chrono::milliseconds(0),
+          py::call_guard<py::gil_scoped_release>()
+      )
+      .def(
           "get_future",
           [](::c10d::Work& work) -> std::shared_ptr<jit::PythonFutureWrapper> {
             return std::make_shared<jit::PythonFutureWrapper>(work.getFuture());

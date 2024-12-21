@@ -297,6 +297,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     // Same as calling synchronize() for NCCL work.
     bool wait(std::chrono::milliseconds timeout = kNoTimeout) override;
 
+    bool waitWithLatDelayMS(std::chrono::milliseconds delay = std::chrono::milliseconds(0)) override;
+
     void abort() override;
 
     // Let current stream wait on the completing of the NCCL work
@@ -440,6 +442,9 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     std::optional<uint64_t> trace_id_;
     DebugLevel distDebugLevel_;
     friend class ProcessGroupNCCL;
+
+    std::shared_ptr<at::cuda::CUDAEvent> endEventForInjection_;
+    int bandwidthDelayMS_{0};
   };
 
   class CUDAEventCache {
@@ -795,7 +800,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
       Fn fn,
       int peer,
       OpType opType,
-      const char* profilingTitle = nullptr);
+      const char* profilingTitle = nullptr,
+      int bandwidthDelayMS = 0);
 
   template <typename Fn, typename PreProcess, typename PostProcess>
   c10::intrusive_ptr<Work> pointToPoint(
@@ -805,7 +811,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
       OpType opType,
       PreProcess pre,
       PostProcess post,
-      const char* profilingTitle);
+      const char* profilingTitle,
+      int bandwidthDelayMS);
 
   c10::intrusive_ptr<Work> allreduce_impl(
       at::Tensor& tensor,
