@@ -784,7 +784,7 @@ bool ProcessGroupNCCL::WorkNCCL::waitWithLatDelayMS(std::chrono::milliseconds de
     // sleep for remaining_delay milliseconds
     int64_t sleepCycles = (int64_t)clockRate * remaining_delay;
     // sleep on the stream
-    at::cuda::sleep(sleepCycles, currentStream);
+    at::cuda::sleep_on_stream(sleepCycles, currentStream);
   }
   return true;
 }
@@ -3256,7 +3256,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     // sleep for bandwidthDelayMS milliseconds
     int64_t sleepCycles = (int64_t)clockRate * bandwidthDelayMS;
     // sleep on the stream
-    at::cuda::sleep(sleepCycles, ncclStream);
+    at::cuda::sleep_on_stream(sleepCycles, ncclStream);
   }
 
   // Enqueue P2P op so that it can be cancelled by NCCL watchdog

@@ -25,7 +25,14 @@ __global__ void spin_kernel(int64_t cycles) {
 }
 }
 
-void sleep(int64_t cycles, at::cuda::CUDAStream stream) {
+void sleep(int64_t cycles) {
+  dim3 grid(1);
+  dim3 block(1);
+  spin_kernel<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sleep_on_stream(int64_t cycles, at::cuda::CUDAStream& stream) {
   dim3 grid(1);
   dim3 block(1);
   spin_kernel<<<grid, block, 0, stream>>>(cycles);
